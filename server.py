@@ -4,14 +4,20 @@ file-converter-mcp
 
 1단계: 이미지 변환 (PNG · JPG · WebP · HEIC · GIF · BMP · TIFF)
 2단계: 영상·음성 변환 (MOV · MP4 · WebM · GIF · MP3 · M4A · WAV)
+3단계: 문서 변환 (HWP · DOCX · PPTX · XLSX → PDF, HWP → DOCX, PDF → DOCX·이미지, 이미지 → PDF, XLSX ↔ CSV)
 - 파일은 내 컴퓨터 밖으로 나가지 않습니다.
 - 원본은 절대 덮어쓰지 않고, 변환 결과는 별도 폴더에 저장합니다.
 """
 
 from __future__ import annotations
 
+import csv
+import os
+import platform
 import shutil
 import subprocess
+import tempfile
+import urllib.request
 import sys
 from pathlib import Path
 
@@ -35,7 +41,9 @@ mcp = MCPServer(
         "로컬 파일 변환 도구입니다. 사용자가 이미지·영상·음성의 확장자 변경, "
         "용량 줄이기, 크기 줄이기, 폴더 일괄 변환, 영상에서 소리 추출, "
         "영상을 GIF로 만들기를 요청하면 이 도구를 사용하세요. "
-        "이미지는 convert_file / convert_folder, 영상·음성은 convert_video / convert_video_folder를 쓰세요. "
+        "이미지는 convert_file / convert_folder, 영상·음성은 convert_video / convert_video_folder, "
+        "문서(HWP·DOCX·PPTX·XLSX·PDF·CSV)는 convert_document / convert_document_folder, "
+        "여러 이미지를 PDF 하나로 묶을 때는 images_to_pdf를 쓰세요. "
         "경로는 사용자 컴퓨터의 절대 경로(~ 사용 가능)를 넘기세요."
     ),
 )
@@ -160,6 +168,10 @@ def list_formats() -> dict:
             "읽기 가능": sorted(e.lstrip(".") for e in MEDIA_INPUT_EXTENSIONS),
             "변환 가능": sorted(VIDEO_OUTPUTS),
             "엔진(FFmpeg) 준비됨": _find_ffmpeg() is not None,
+        },
+        "문서": {
+            "변환 경로": DOC_ROUTES_HELP,
+            "LibreOffice 설치됨 (HWP·오피스 → PDF에 필요)": _find_soffice() is not None,
         },
     }
 
@@ -539,6 +551,430 @@ def convert_video_folder(
         "전체 용량": summary,
         "파일 목록": done[:50],
     }
+
+
+# ─────────────────────────────────────────────
+# 3단계: 문서 변환
+#  - PDF → DOCX / 이미지, 이미지 → PDF, XLSX ↔ CSV : pip 패키지만으로 동작
+#  - HWP·HWPX·DOCX·PPTX·XLSX → PDF, HWP → DOCX : LibreOffice 필요 (무료, 한 번만 설치)
+# ─────────────────────────────────────────────
+
+OFFICE_INPUTS = {
+    ".hwp", ".hwpx", ".doc", ".docx", ".odt", ".rtf", ".txt",
+    ".ppt", ".pptx", ".odp", ".key",
+    ".xls", ".xlsx", ".ods",
+}
+HWP_INPUTS = {".hwp", ".hwpx"}
+WRITER_INPUTS = {".hwp", ".hwpx", ".doc", ".docx", ".odt", ".rtf", ".txt"}
+SHEET_INPUTS = {".xls", ".xlsx", ".ods"}
+DOC_INPUT_EXTENSIONS = OFFICE_INPUTS | {".pdf", ".csv"}
+
+DOC_ROUTES_HELP = [
+    "hwp · hwpx · doc · docx · pptx · xlsx 등 → pdf",
+    "hwp · hwpx · doc · odt · rtf → docx",
+    "pdf → docx",
+    "pdf → png · jpg (페이지별 이미지)",
+    "xlsx → csv (시트별), csv → xlsx",
+    "이미지 여러 장 → pdf 하나 (images_to_pdf)",
+]
+
+# HWP를 읽게 해주는 LibreOffice 확장 기능 (H2Orestart, GPL-3.0)
+H2O_URL = "https://raw.githubusercontent.com/ebandal/H2Orestart/main/dist/H2Orestart.oxt"
+APP_DIR = Path.home() / ".file-converter-mcp"
+
+
+def _find_soffice() -> str | None:
+    candidates = [
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        str(Path.home() / "Applications/LibreOffice.app/Contents/MacOS/soffice"),
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+    ]
+    for c in candidates:
+        if Path(c).exists():
+            return c
+    return shutil.which("soffice") or shutil.which("libreoffice")
+
+
+def _require_soffice() -> str:
+    soffice = _find_soffice()
+    if soffice:
+        return soffice
+    if platform.system() == "Darwin":
+        how = (
+            "터미널에서 `brew install --cask libreoffice` 를 실행하거나, "
+            "https://www.libreoffice.org/download 에서 macOS용을 받아 설치해주세요. "
+        )
+    else:
+        how = "https://www.libreoffice.org/download 에서 LibreOffice를 설치해주세요. "
+    raise ToolError(
+        "HWP·오피스 문서를 변환하려면 무료 프로그램 LibreOffice가 한 번 설치돼 있어야 해요. "
+        + how + "설치 후 다시 요청하면 됩니다."
+    )
+
+
+def _unopkg_path(soffice: str) -> str | None:
+    p = Path(soffice).with_name("unopkg.exe" if soffice.endswith(".exe") else "unopkg")
+    return str(p) if p.exists() else shutil.which("unopkg")
+
+
+def _ensure_hwp_support(soffice: str) -> None:
+    """HWP 확장 기능이 없으면 처음 한 번 자동으로 내려받아 설치"""
+    unopkg = _unopkg_path(soffice)
+    if not unopkg:
+        raise ToolError("LibreOffice의 확장 관리 도구(unopkg)를 찾지 못했어요. LibreOffice를 다시 설치해주세요.")
+
+    listed = subprocess.run([unopkg, "list"], capture_output=True, text=True, timeout=120)
+    shared = subprocess.run([unopkg, "list", "--shared"], capture_output=True, text=True, timeout=120)
+    if "H2Orestart" in (listed.stdout + shared.stdout):
+        return
+
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    oxt = APP_DIR / "H2Orestart.oxt"
+    if not oxt.exists():
+        _log("[file-convert] HWP 확장 기능 내려받는 중...")
+        try:
+            urllib.request.urlretrieve(H2O_URL, oxt)
+        except Exception as e:
+            oxt.unlink(missing_ok=True)
+            raise ToolError(f"HWP 확장 기능을 내려받지 못했어요. 인터넷 연결을 확인해주세요. ({e})")
+
+    _log("[file-convert] HWP 확장 기능 설치 중...")
+    cmd = [unopkg, "add", "--suppress-license", str(oxt)]
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        cmd.insert(2, "--shared")  # 관리자(root) 계정에서는 공용 설치만 허용됨
+    proc = subprocess.run(
+        cmd,
+        capture_output=True, text=True, timeout=300,
+    )
+    if proc.returncode != 0:
+        raise ToolError(
+            "HWP 확장 기능 설치에 실패했어요. LibreOffice 창이 열려 있다면 닫고 다시 시도해주세요. "
+            f"({(proc.stderr or proc.stdout).strip()[-200:]})"
+        )
+
+
+def _soffice_convert(src: Path, out_dir: Path, target: str) -> Path:
+    """LibreOffice로 변환. target 예: 'pdf', 'docx:MS Word 2007 XML'"""
+    soffice = _require_soffice()
+    if src.suffix.lower() in HWP_INPUTS:
+        _ensure_hwp_support(soffice)
+
+    ext = target.split(":")[0]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # 같은 이름 덮어쓰기 방지를 위해 임시 폴더에 만든 뒤 옮김
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            proc = subprocess.run(
+                [soffice, "--headless", "--norestore", "--convert-to", target, "--outdir", tmp, str(src)],
+                capture_output=True, text=True, timeout=300,
+            )
+        except subprocess.TimeoutExpired:
+            raise ToolError(f"{src.name} 변환 시간이 너무 오래 걸려 중단했어요.")
+        produced = Path(tmp) / f"{src.stem}.{ext}"
+        if not produced.exists():
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            raise ToolError(
+                f"{src.name} 변환 실패. LibreOffice 창이 열려 있다면 닫고 다시 시도해주세요."
+                + (f" ({detail[-1][:200]})" if detail else "")
+            )
+        dst = _unique_path(out_dir / produced.name)
+        shutil.move(str(produced), dst)
+    return dst
+
+
+def _pdf_to_docx(src: Path, out_dir: Path) -> Path:
+    from pdf2docx import Converter
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dst = _unique_path(out_dir / f"{src.stem}.docx")
+    cv = Converter(str(src))
+    try:
+        cv.convert(str(dst))
+    finally:
+        cv.close()
+    return dst
+
+
+def _pdf_to_images(src: Path, out_dir: Path, fmt: str, dpi: int) -> list[Path]:
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(str(src))
+    target = _unique_path(out_dir / src.stem)
+    target.mkdir(parents=True, exist_ok=True)
+    results = []
+    try:
+        digits = len(str(len(pdf)))
+        for i, page in enumerate(pdf, start=1):
+            img = page.render(scale=dpi / 72).to_pil()
+            if fmt == "jpg":
+                img = img.convert("RGB")
+            path = target / f"{src.stem}_{str(i).zfill(digits)}.{fmt}"
+            img.save(path, "JPEG" if fmt == "jpg" else "PNG", **({"quality": 92} if fmt == "jpg" else {}))
+            results.append(path)
+    finally:
+        pdf.close()
+    return results
+
+
+def _xlsx_to_csv(src: Path, out_dir: Path) -> list[Path]:
+    from openpyxl import load_workbook
+
+    wb = load_workbook(src, read_only=True, data_only=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+    try:
+        multi = len(wb.sheetnames) > 1
+        for ws in wb.worksheets:
+            name = f"{src.stem}_{ws.title}.csv" if multi else f"{src.stem}.csv"
+            dst = _unique_path(out_dir / name)
+            # utf-8-sig: 윈도우 엑셀에서 열어도 한글이 안 깨짐
+            with open(dst, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                for row in ws.iter_rows(values_only=True):
+                    writer.writerow(["" if v is None else v for v in row])
+            results.append(dst)
+    finally:
+        wb.close()
+    return results
+
+
+def _read_csv_rows(src: Path) -> list[list[str]]:
+    for enc in ("utf-8-sig", "cp949", "euc-kr", "utf-8"):
+        try:
+            with open(src, newline="", encoding=enc) as f:
+                return list(csv.reader(f))
+        except UnicodeDecodeError:
+            continue
+    raise ToolError(f"{src.name}의 글자 인코딩을 읽지 못했어요.")
+
+
+def _cell_value(v: str):
+    """숫자는 숫자로, 나머지는 글자로. 0으로 시작하는 값(전화번호·우편번호)은 글자로 유지"""
+    t = v.strip()
+    if not t or (len(t) > 1 and t.startswith("0") and not t.startswith("0.")):
+        return v
+    try:
+        return int(t)
+    except ValueError:
+        pass
+    try:
+        return float(t)
+    except ValueError:
+        return v
+
+
+def _csv_to_xlsx(src: Path, out_dir: Path) -> Path:
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = src.stem[:31] or "Sheet1"
+    for row in _read_csv_rows(src):
+        ws.append([_cell_value(v) for v in row])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dst = _unique_path(out_dir / f"{src.stem}.xlsx")
+    wb.save(dst)
+    return dst
+
+
+def _convert_document_one(src: Path, fmt: str, out_dir: Path, dpi: int) -> dict:
+    ext = src.suffix.lower()
+    outputs: list[Path]
+
+    if ext == ".pdf":
+        if fmt == "docx":
+            outputs = [_pdf_to_docx(src, out_dir)]
+        elif fmt in ("png", "jpg"):
+            outputs = _pdf_to_images(src, out_dir, fmt, dpi)
+        else:
+            raise ToolError("PDF는 docx, png, jpg로 바꿀 수 있어요.")
+    elif ext == ".csv":
+        if fmt != "xlsx":
+            raise ToolError("CSV는 xlsx로 바꿀 수 있어요.")
+        outputs = [_csv_to_xlsx(src, out_dir)]
+    elif ext in OFFICE_INPUTS:
+        if fmt == "pdf":
+            outputs = [_soffice_convert(src, out_dir, "pdf")]
+        elif fmt == "docx" and ext in WRITER_INPUTS and ext != ".docx":
+            outputs = [_soffice_convert(src, out_dir, "docx:MS Word 2007 XML")]
+        elif fmt == "csv" and ext == ".xlsx":
+            outputs = _xlsx_to_csv(src, out_dir)
+        elif fmt == "csv" and ext in SHEET_INPUTS:
+            outputs = [_soffice_convert(src, out_dir, "csv:Text - txt - csv (StarCalc):44,34,76,1")]
+        elif fmt == "xlsx" and ext in SHEET_INPUTS and ext != ".xlsx":
+            outputs = [_soffice_convert(src, out_dir, "xlsx:Calc MS Excel 2007 XML")]
+        elif fmt == "pptx" and ext in {".ppt", ".odp", ".key"}:
+            outputs = [_soffice_convert(src, out_dir, "pptx:Impress MS PowerPoint 2007 XML")]
+        else:
+            raise ToolError(f"{ext.lstrip('.')} → {fmt} 변환은 아직 지원하지 않아요. 가능한 경로: " + " / ".join(DOC_ROUTES_HELP))
+    else:
+        raise ToolError(f"문서 파일이 아니거나 아직 지원하지 않는 형식이에요: {src.name}")
+
+    before = src.stat().st_size
+    after = sum(p.stat().st_size for p in outputs)
+    result = {
+        "원본": str(src),
+        "결과": str(outputs[0]) if len(outputs) == 1 else f"{len(outputs)}개 파일 → {outputs[0].parent}",
+        "용량": f"{_human_size(before)} → {_human_size(after)}",
+        "_before": before,
+        "_after": after,
+        "_names": [p.name for p in outputs],
+    }
+    if src.suffix.lower() in HWP_INPUTS:
+        result["참고"] = "HWP는 표·글꼴·줄 간격이 원본과 조금 다를 수 있어요. 중요한 문서는 결과를 한 번 확인해주세요."
+    return result
+
+
+@mcp.tool()
+def convert_document(
+    path: str,
+    to_format: str,
+    dpi: int = 150,
+    output_dir: str | None = None,
+) -> dict:
+    """
+    문서 파일 하나를 변환합니다. 원본은 그대로 둡니다.
+    - hwp · hwpx · doc · docx · pptx · xlsx 등 → pdf
+    - hwp · hwpx · doc · odt · rtf → docx (워드에서 편집 가능)
+    - pdf → docx, pdf → png / jpg (페이지별 이미지)
+    - xlsx → csv (시트가 여러 개면 시트별로), csv → xlsx
+    HWP·오피스 → PDF/DOCX는 LibreOffice가 필요하며, HWP 확장 기능은 처음 한 번 자동 설치됩니다.
+
+    Args:
+        path: 변환할 파일 경로 (예: ~/Downloads/공고문.hwp)
+        to_format: pdf, docx, png, jpg, csv, xlsx, pptx
+        dpi: PDF → 이미지 변환 시 해상도 (기본 150, 인쇄용은 300)
+        output_dir: 저장할 폴더. 비우면 원본 옆 'converted_형식' 폴더
+    """
+    src = Path(path).expanduser().resolve()
+    if not src.is_file():
+        raise ToolError(f"파일을 찾을 수 없어요: {src}")
+    fmt = to_format.lower().lstrip(".").strip()
+    fmt = "jpg" if fmt == "jpeg" else fmt
+    out_dir = Path(output_dir).expanduser().resolve() if output_dir else src.parent / f"converted_{fmt}"
+
+    result = _convert_document_one(src, fmt, out_dir, dpi)
+    _log(f"[file-convert] {src.name} → {result['결과']}")
+    return {k: v for k, v in result.items() if not k.startswith("_")}
+
+
+@mcp.tool()
+def convert_document_folder(
+    folder: str,
+    to_format: str,
+    from_format: str | None = None,
+    include_subfolders: bool = False,
+    output_dir: str | None = None,
+) -> dict:
+    """
+    폴더 안의 문서를 한 번에 변환합니다. 원본은 그대로 둡니다.
+    예: 폴더 안 hwp 전부 pdf로, docx 전부 pdf로, xlsx 전부 csv로
+
+    Args:
+        folder: 문서가 들어 있는 폴더 경로
+        to_format: pdf, docx, png, jpg, csv, xlsx
+        from_format: 특정 형식만 변환할 때 지정 (예: hwp). 비우면 바꿀 수 있는 문서 전부
+        include_subfolders: 하위 폴더까지 포함할지 여부
+        output_dir: 저장할 폴더. 비우면 대상 폴더 안 'converted_형식' 폴더
+    """
+    base = Path(folder).expanduser().resolve()
+    if not base.is_dir():
+        raise ToolError(f"폴더를 찾을 수 없어요: {base}")
+    fmt = to_format.lower().lstrip(".").strip()
+    fmt = "jpg" if fmt == "jpeg" else fmt
+    only = ("." + from_format.lower().lstrip(".")) if from_format else None
+    out_root = Path(output_dir).expanduser().resolve() if output_dir else base / f"converted_{fmt}"
+
+    pattern = "**/*" if include_subfolders else "*"
+    files = sorted(
+        p for p in base.glob(pattern)
+        if p.is_file()
+        and p.suffix.lower() in DOC_INPUT_EXTENSIONS
+        and (only is None or p.suffix.lower() == only)
+        and p.suffix.lower() != f".{fmt}"
+        and not p.name.startswith("~$")  # 열려 있는 오피스 문서의 임시 파일 제외
+        and out_root not in p.parents
+        and not any(part.startswith("converted_") for part in p.relative_to(base).parts[:-1])
+    )
+    if not files:
+        return {"메시지": "변환할 문서가 없어요.", "폴더": str(base)}
+
+    done, failed = [], []
+    total_before = total_after = 0
+    for src in files:
+        target_dir = out_root / src.parent.relative_to(base)
+        try:
+            r = _convert_document_one(src, fmt, target_dir, 150)
+            total_before += r["_before"]
+            total_after += r["_after"]
+            done.extend(r["_names"])
+        except Exception as e:
+            failed.append({"파일": src.name, "이유": str(e)})
+
+    _log(f"[file-convert] 문서 {len(files) - len(failed)}/{len(files)}개 변환 → {out_root}")
+    return {
+        "변환 완료": f"{len(files) - len(failed)}개",
+        "실패": failed,
+        "저장 위치": str(out_root),
+        "전체 용량": f"{_human_size(total_before)} → {_human_size(total_after)}",
+        "파일 목록": done[:50],
+    }
+
+
+@mcp.tool()
+def images_to_pdf(
+    paths: list[str] | None = None,
+    folder: str | None = None,
+    output_name: str | None = None,
+    output_dir: str | None = None,
+) -> dict:
+    """
+    이미지 여러 장을 PDF 파일 하나로 묶습니다. (스캔본·사진 제출용)
+    paths로 파일 목록을 주거나, folder로 폴더 안 이미지 전체(파일명 순)를 지정하세요.
+
+    Args:
+        paths: 이미지 파일 경로 목록 (이 순서대로 페이지가 됨)
+        folder: 이미지가 들어 있는 폴더 경로 (파일명 순서로 묶음)
+        output_name: 만들 PDF 이름 (확장자 없이). 비우면 폴더명 또는 첫 파일명
+        output_dir: 저장할 폴더. 비우면 이미지가 있는 곳의 'converted_pdf' 폴더
+    """
+    if paths:
+        files = [Path(p).expanduser().resolve() for p in paths]
+        missing = [str(p) for p in files if not p.is_file()]
+        if missing:
+            raise ToolError(f"파일을 찾을 수 없어요: {', '.join(missing[:5])}")
+        base = files[0].parent
+        default_name = files[0].stem
+    elif folder:
+        base = Path(folder).expanduser().resolve()
+        if not base.is_dir():
+            raise ToolError(f"폴더를 찾을 수 없어요: {base}")
+        files = sorted(p for p in base.iterdir() if p.is_file() and p.suffix.lower() in INPUT_EXTENSIONS)
+        default_name = base.name
+    else:
+        raise ToolError("paths(파일 목록)나 folder(폴더) 중 하나를 지정해주세요.")
+    if not files:
+        raise ToolError("PDF로 묶을 이미지가 없어요.")
+
+    pages = []
+    for p in files:
+        with Image.open(p) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode in ("RGBA", "LA", "P"):
+                img = img.convert("RGBA")
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[-1])
+                img = bg
+            else:
+                img = img.convert("RGB")
+            pages.append(img.copy())
+
+    out_dir = Path(output_dir).expanduser().resolve() if output_dir else base / "converted_pdf"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dst = _unique_path(out_dir / f"{output_name or default_name}.pdf")
+    pages[0].save(dst, "PDF", save_all=True, append_images=pages[1:], resolution=150)
+    _log(f"[file-convert] 이미지 {len(pages)}장 → {dst}")
+    return {"결과": str(dst), "페이지 수": len(pages), "용량": _human_size(dst.stat().st_size)}
 
 
 if __name__ == "__main__":

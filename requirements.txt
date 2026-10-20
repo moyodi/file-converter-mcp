@@ -2,3 +2,6 @@ mcp>=2.3,<3
 pillow>=11
 pillow-heif>=0.18
 imageio-ffmpeg>=0.5
+pdf2docx>=0.5
+pypdfium2>=4
+openpyxl>=3.1

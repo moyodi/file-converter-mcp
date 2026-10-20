@@ -1,6 +1,6 @@
 # file-converter-mcp
 
-로컬에서 이미지·영상·음성 파일을 변환하는 MCP 서버입니다.
+로컬에서 문서·이미지·영상·음성 파일을 변환하는 MCP 서버입니다.
 Cursor나 Claude 데스크톱 앱에 연결해 채팅으로 변환을 요청할 수 있습니다.
 
 변환 사이트에 파일을 올리고 내려받는 과정이 번거롭고, 회사 파일을 외부에 올리기도 애매해서 만들었습니다.
@@ -8,6 +8,9 @@ Cursor나 Claude 데스크톱 앱에 연결해 채팅으로 변환을 요청할 
 
 ## 기능
 
+- 문서 변환: HWP · HWPX · DOCX · PPTX · XLSX → PDF, HWP → DOCX
+- PDF → DOCX, PDF → 페이지별 이미지, 이미지 여러 장 → PDF 하나
+- 엑셀 ↔ CSV (윈도우 엑셀에서 열어도 한글이 깨지지 않게 저장)
 - 이미지 형식 변환 (PNG, JPG, WebP, HEIC, GIF, BMP, TIFF), 화질·크기 조절
 - 영상 형식 변환 (MOV, MP4, WebM 등), 영상 → GIF
 - 영상에서 소리 추출 (MP3, M4A, WAV)
@@ -28,6 +31,20 @@ python3 -m venv .venv
 ```
 
 영상 변환에 필요한 FFmpeg는 위 설치 과정에서 함께 설치됩니다.
+
+### HWP·오피스 문서 → PDF를 쓰려면
+
+무료 오피스 프로그램 LibreOffice가 한 번 설치돼 있어야 합니다.
+Homebrew를 쓰고 있다면 아래 한 줄로 설치하고, 아니라면 [libreoffice.org](https://www.libreoffice.org/download)에서 macOS용을 내려받아 설치합니다.
+
+```bash
+brew install --cask libreoffice
+```
+
+HWP를 읽는 데 필요한 확장 기능([H2Orestart](https://github.com/ebandal/H2Orestart))은 처음 HWP를 변환할 때 자동으로 설치됩니다.
+변환 중에는 LibreOffice 창을 닫아두세요.
+
+PDF → DOCX, PDF → 이미지, 이미지 → PDF, 엑셀 ↔ CSV는 LibreOffice 없이도 동작합니다.
 
 ## Cursor 연결
 
@@ -54,6 +71,11 @@ Claude 데스크톱 앱은 `~/Library/Application Support/Claude/claude_desktop_
 채팅에서 파일 경로와 원하는 형식을 말하면 됩니다.
 
 ```
+~/Downloads/공고문.hwp pdf로 바꿔줘
+~/Downloads 폴더 hwp 파일 전부 pdf로 바꿔줘
+이 pdf 워드 파일로 바꿔줘
+스캔 폴더 사진들 pdf 하나로 묶어줘
+상품목록.xlsx csv로 바꿔줘
 ~/Downloads/IMG_1234.HEIC jpg로 바꿔줘
 ~/Desktop/상품사진 폴더 전부 webp로, 가로 1000으로 줄여서
 ~/Desktop/IMG_0001.MOV mp4로 바꿔줘
@@ -67,6 +89,9 @@ Finder에서 파일을 우클릭한 상태로 option 키를 누르면 "경로 �
 
 | 도구 | 설명 |
 |---|---|
+| `convert_document` | 문서 1개 변환 |
+| `convert_document_folder` | 폴더 안 문서 일괄 변환 (특정 형식만 고를 수 있음) |
+| `images_to_pdf` | 이미지 여러 장을 PDF 하나로 묶기 |
 | `convert_file` | 이미지 1개 변환 |
 | `convert_folder` | 폴더 안 이미지 일괄 변환 |
 | `convert_video` | 영상·음성 1개 변환 |
@@ -80,6 +105,7 @@ Finder에서 파일을 우클릭한 상태로 option 키를 누르면 "경로 �
 - `start`, `duration` : 영상 구간 지정 (초 단위). GIF는 지정하지 않으면 앞 10초만 만듭니다.
 - `mute` : 영상에서 소리를 빼고 저장합니다.
 - `include_subfolders` : 폴더 변환 시 하위 폴더까지 포함합니다.
+- `dpi` : PDF → 이미지 해상도 (기본 150, 인쇄용은 300)
 
 ## 업데이트
 
@@ -92,5 +118,5 @@ cd ~/file-converter-mcp && git pull && .venv/bin/pip install -r requirements.txt
 ## 참고
 
 - 본인이 소유하거나 사용 권한이 있는 파일에 사용해주세요.
-- 사용한 라이브러리: [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk), [Pillow](https://python-pillow.org), [pillow-heif](https://github.com/bigcat88/pillow_heif), [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg)
-- 앞으로 엑셀 ↔ CSV, 문서 → PDF, HWP 변환을 추가해볼 예정입니다.
+- HWP는 표·글꼴·줄 간격이 원본과 조금 다를 수 있습니다. 중요한 문서는 결과를 한 번 확인해주세요.
+- 사용한 라이브러리: [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk), [Pillow](https://python-pillow.org), [pillow-heif](https://github.com/bigcat88/pillow_heif), [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg), [pdf2docx](https://github.com/ArtifexSoftware/pdf2docx), [pypdfium2](https://github.com/pypdfium2-team/pypdfium2), [openpyxl](https://openpyxl.readthedocs.io), [LibreOffice](https://www.libreoffice.org), [H2Orestart](https://github.com/ebandal/H2Orestart)
